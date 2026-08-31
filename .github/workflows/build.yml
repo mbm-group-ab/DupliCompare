@@ -1,0 +1,59 @@
+name: Build Cross-Platform Executables
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: DupliCompare-windows.exe
+            build_path: dist/DupliCompare.exe
+          - os: macos-latest
+            artifact_name: DupliCompare-macos
+            build_path: dist/DupliCompare
+          - os: ubuntu-latest
+            artifact_name: DupliCompare-linux
+            build_path: dist/DupliCompare
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Tk (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build executable (Windows, with icon)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --windowed --name DupliCompare --icon assets/icon.ico drive_compare.py
+
+      - name: Build executable (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: pyinstaller --onefile --windowed --name DupliCompare drive_compare.py
+
+      - name: Rename artifact
+        shell: bash
+        run: cp "${{ matrix.build_path }}" "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_name }}
