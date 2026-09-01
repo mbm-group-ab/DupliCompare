@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "mbm-group-ab"
-  }
+  },
+  "targets": {
+    "mbm-group-ab": {
+      "hosting": {
+        "duplicompare": [
+          "duplicompare"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }
