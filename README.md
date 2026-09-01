@@ -7,7 +7,7 @@ A free, cross-platform GUI app that:
   lets you review each duplicate group side by side — delete, rename, or
   move any copy right from the app.
 
-Landing page with download links: https://duplicompare.com (see
+Landing page with download links: https://duplicompare.mbm-group.se (see
 [index.html](index.html)).
 
 ## Run from source (any OS with Python 3)
@@ -51,29 +51,19 @@ download links on the landing page (`releases/latest/download/...`) work.
    column header to sort; double-click a group (or "Open Group...") to see
    every copy side by side and delete/rename/move them.
 
-## Deploying the landing page to a server
+## Deploying the landing page
 
-The static landing page (`index.html` + `assets/`) ships with a
-`Dockerfile`, `docker-compose.yml`, and a GitHub Actions workflow
-(`.github/workflows/deploy.yml`) that deploys it over SSH on every push to
-`main`.
+The static landing page (`index.html` + `assets/`) deploys to **Firebase
+Hosting**, site `duplicompare` in the `mbm-group-ab` Firebase project
+(same project as `company-site`), via
+`.github/workflows/deploy-firebase.yml` on every push to `main`.
 
-**One-time setup:**
-1. Point the domain's DNS A record at the server's IP.
-2. In the GitHub repo, add these secrets (Settings → Secrets and variables
-   → Actions):
+- Firebase URL: https://duplicompare.web.app
+- Custom domain: `duplicompare.mbm-group.se` (add as a custom domain in
+  Firebase Hosting console for the `duplicompare` site, then point its DNS
+  record — Firebase gives you the exact record to add — at Firebase).
 
-   | Secret | Value |
-   |---|---|
-   | `VPS_HOST` | server IP/hostname |
-   | `VPS_USER` | SSH deploy user |
-   | `VPS_SSH_KEY` | that user's SSH private key |
-   | `GH_PAT` | GitHub PAT with read access to this repo (used to clone on first deploy) |
-
-3. Push to `main` (or run the workflow manually) — it clones/pulls the repo
-   on the server and runs `docker compose up -d --build`.
-4. On the server: `sudo cp deploy/nginx.conf /etc/nginx/conf.d/duplicompare.conf && sudo nginx -t && sudo systemctl reload nginx`
-5. `sudo certbot --nginx -d duplicompare.com -d www.duplicompare.com` for
-   HTTPS (only works once DNS has propagated). Certbot rewrites the conf
-   file to add the SSL block — pull that live version back into
-   `deploy/nginx.conf` afterwards so the repo matches reality.
+**One-time setup:** the repo secret `FIREBASE_SERVICE_ACCOUNT` must hold
+the same service-account JSON key used by `company-site` (it already has
+the `firebase.sdkAdminServiceAgent` role on the `mbm-group-ab` project,
+which covers Hosting deploys for every site in that project).
