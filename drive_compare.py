@@ -11,12 +11,27 @@ import webbrowser
 import html
 import hashlib
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import shutil
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+
+FILE_TYPE_FILTERS = {
+    "All files": None,
+    "Archives (.zip, .rar, .7z, .tar, .gz)": {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"
+    },
+    "Photos (.jpg, .png, .gif, ...)": {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".tiff", ".raw"
+    },
+    "Text/Documents (.txt, .doc, .pdf, ...)": {
+        ".txt", ".doc", ".docx", ".pdf", ".rtf", ".odt", ".md", ".csv", ".xls", ".xlsx"
+    },
+}
 
 
 def build_file_map(root):
@@ -137,19 +152,34 @@ tr:nth-child(even){{background:#f2f2f2}}
         f.write(html_doc)
 
 
-def file_hash(path, chunk_size=1024 * 1024):
+def file_hash(path, chunk_size=1024 * 1024, max_bytes=None):
+    """MD5 of a file. If max_bytes is set, only hash the first max_bytes
+    (used for a cheap partial-hash pre-filter)."""
     h = hashlib.md5()
+    read_total = 0
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
+        while max_bytes is None or read_total < max_bytes:
+            to_read = chunk_size if max_bytes is None else min(chunk_size, max_bytes - read_total)
+            chunk = f.read(to_read)
+            if not chunk:
+                break
             h.update(chunk)
+            read_total += len(chunk)
     return h.hexdigest()
 
 
-def find_duplicates(root, progress_cb=None):
+PARTIAL_HASH_BYTES = 64 * 1024
+
+
+def find_duplicates(root, progress_cb=None, extensions=None, min_size_bytes=0, max_workers=8):
     """Scan root recursively and return list of duplicate groups.
 
     Each group is a list of full file paths that share identical size and
     content (md5 hash). Only groups with 2+ files are returned.
+
+    extensions: optional set of lowercase extensions (e.g. {".zip", ".rar"})
+    to restrict the scan to. None means all files.
+    min_size_bytes: skip files smaller than this.
     """
     root = os.path.abspath(root)
     if progress_cb:
@@ -158,24 +188,69 @@ def find_duplicates(root, progress_cb=None):
     by_size = defaultdict(list)
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
+            if extensions is not None and os.path.splitext(name)[1].lower() not in extensions:
+                continue
             full = os.path.join(dirpath, name)
             try:
                 size = os.path.getsize(full)
             except OSError:
                 continue
+            if size < min_size_bytes:
+                continue
             by_size[size].append(full)
 
+    # Only same-size files can possibly be duplicates.
     candidates = [paths for paths in by_size.values() if len(paths) > 1]
-
-    by_hash = defaultdict(list)
+    total_candidates = sum(len(paths) for paths in candidates)
     checked = 0
-    for paths in candidates:
-        for full in paths:
+    lock = threading.Lock()
+
+    def bump(msg_prefix):
+        nonlocal checked
+        with lock:
             checked += 1
-            if progress_cb and checked % 25 == 0:
-                progress_cb(f"Hashing files... ({checked})")
+            n = checked
+        if progress_cb and n % 25 == 0:
+            progress_cb(f"{msg_prefix} ({n}/{total_candidates})")
+
+    # Pass 1: cheap partial hash (first 64KB) to cut down full-file reads.
+    by_partial = defaultdict(list)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for paths in candidates:
+            for full in paths:
+                fut = pool.submit(file_hash, full, max_bytes=PARTIAL_HASH_BYTES)
+                futures[fut] = full
+        for fut in as_completed(futures):
+            full = futures[fut]
+            bump("Quick-hashing files...")
             try:
-                digest = file_hash(full)
+                digest = fut.result()
+            except OSError:
+                continue
+            by_partial[digest].append(full)
+
+    partial_groups = [paths for paths in by_partial.values() if len(paths) > 1]
+
+    # Pass 2: full hash only for files that still collide after the quick check.
+    checked = 0
+    total_full = sum(len(paths) for paths in partial_groups)
+    by_hash = defaultdict(list)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for paths in partial_groups:
+            for full in paths:
+                fut = pool.submit(file_hash, full)
+                futures[fut] = full
+        for fut in as_completed(futures):
+            full = futures[fut]
+            with lock:
+                checked += 1
+                n = checked
+            if progress_cb and n % 25 == 0:
+                progress_cb(f"Hashing files... ({n}/{total_full})")
+            try:
+                digest = fut.result()
             except OSError:
                 continue
             by_hash[digest].append(full)
@@ -245,8 +320,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DupliCompare")
-        self.geometry("760x480")
-        self.minsize(680, 420)
+        self.geometry("980x560")
+        self.minsize(860, 460)
         try:
             self.iconbitmap(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico"))
         except tk.TclError:
@@ -353,10 +428,31 @@ class App(tk.Tk):
         top.pack(fill="x")
 
         ttk.Label(top, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(top, textvariable=self.dup_path, width=55).grid(row=0, column=1, **pad)
+        ttk.Entry(top, textvariable=self.dup_path, width=45).grid(row=0, column=1, **pad)
         ttk.Button(top, text="Browse...", command=self.browse_dup).grid(row=0, column=2, **pad)
+
+        ttk.Label(top, text="Type:").grid(row=0, column=3, sticky="w", **pad)
+        self.dup_filter = tk.StringVar(value="All files")
+        filter_combo = ttk.Combobox(
+            top, textvariable=self.dup_filter, values=list(FILE_TYPE_FILTERS.keys()),
+            state="readonly", width=28,
+        )
+        filter_combo.grid(row=0, column=4, **pad)
+
         self.scan_btn = ttk.Button(top, text="Scan for Duplicates", command=self.start_duplicates)
-        self.scan_btn.grid(row=0, column=3, **pad)
+        self.scan_btn.grid(row=0, column=5, **pad)
+
+        ttk.Label(top, text="Min file size:").grid(row=1, column=0, sticky="w", **pad)
+        self.min_size_mb = tk.DoubleVar(value=0)
+        self.min_size_label = tk.StringVar(value="No limit")
+        min_size_scale = ttk.Scale(
+            top, from_=0, to=1024, orient="horizontal", variable=self.min_size_mb,
+            command=self._on_min_size_change, length=300,
+        )
+        min_size_scale.grid(row=1, column=1, columnspan=3, sticky="we", **pad)
+        ttk.Label(top, textvariable=self.min_size_label, width=14).grid(
+            row=1, column=4, sticky="w", **pad
+        )
 
         self.dup_progress = ttk.Progressbar(self.dup_tab, mode="indeterminate", length=500)
         self.dup_progress.pack(fill="x", padx=10, pady=(0, 6))
@@ -407,6 +503,10 @@ class App(tk.Tk):
         if d:
             self.dup_path.set(d)
 
+    def _on_min_size_change(self, _value=None):
+        mb = self.min_size_mb.get()
+        self.min_size_label.set("No limit" if mb < 1 else f"≥ {mb:.0f} MB")
+
     def start_duplicates(self):
         a = self.dup_path.get().strip()
         if not a:
@@ -418,15 +518,19 @@ class App(tk.Tk):
 
         self.scan_btn.config(state="disabled")
         self.dup_progress.start(10)
-        thread = threading.Thread(target=self.run_duplicates, args=(a,), daemon=True)
+        extensions = FILE_TYPE_FILTERS.get(self.dup_filter.get())
+        min_size_bytes = int(self.min_size_mb.get() * 1024 * 1024)
+        thread = threading.Thread(
+            target=self.run_duplicates, args=(a, extensions, min_size_bytes), daemon=True
+        )
         thread.start()
 
-    def run_duplicates(self, a):
+    def run_duplicates(self, a, extensions=None, min_size_bytes=0):
         def progress_cb(msg):
             self.dup_status.set(msg)
 
         try:
-            groups = find_duplicates(a, progress_cb)
+            groups = find_duplicates(a, progress_cb, extensions=extensions, min_size_bytes=min_size_bytes)
             self.dup_root = os.path.abspath(a)
             self.after(0, lambda: self._populate_dup_tree(groups))
             self.dup_status.set(f"Done. {len(groups)} duplicate group(s) found.")
