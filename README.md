@@ -53,17 +53,10 @@ download links on the landing page (`releases/latest/download/...`) work.
 
 ## Deploying the landing page
 
-The static landing page (`index.html` + `assets/`) deploys to **Firebase
-Hosting**, site `duplicompare` in the `mbm-group-ab` Firebase project
-(same project as `company-site`), via
-`.github/workflows/deploy-firebase.yml` on every push to `main`.
+The static landing page (`index.html` + `assets/`) is served from the VPS at
+https://duplicompare.mbm-group.se (`static-sites` nginx container, see
+`company-site/deploy/static-sites`). `.github/workflows/deploy-vps.yml` copies the
+files there after the owner's OK in MBM Control (a push only runs the check job).
 
-- Firebase URL: https://duplicompare.web.app
-- Custom domain: `duplicompare.mbm-group.se` (add as a custom domain in
-  Firebase Hosting console for the `duplicompare` site, then point its DNS
-  record — Firebase gives you the exact record to add — at Firebase).
-
-**One-time setup:** the repo secret `FIREBASE_SERVICE_ACCOUNT` must hold
-the same service-account JSON key used by `company-site` (it already has
-the `firebase.sdkAdminServiceAgent` role on the `mbm-group-ab` project,
-which covers Hosting deploys for every site in that project).
+The workflow needs the repo secrets `VPS_HOST`, `VPS_USER` and `VPS_SSH_KEY`
+(`owner-scripts/set-repo-secrets.sh DupliCompare`).
