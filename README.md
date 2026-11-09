@@ -59,6 +59,18 @@ download links on the landing page (`releases/latest/download/...`) work.
    move any of them. "Export HTML Report" writes the same kind of report
    folder (tabs: across folders / inside one folder).
 
+4. **AI summary / advice** (optional, Compare tab and Duplicates tab): turns the
+   last result into a short summary and an ordered clean-up plan, in English,
+   Svenska or فارسی. It shows exactly what it will send (counts, sizes, folder
+   and file names, never file contents), only sends when you press "Send to AI",
+   and uses mbm-ai in `private` mode (local model only). The AI only advises;
+   you do the deleting. It is **off until configured**, because the app is
+   public and ships no key: put `{"url": "http://127.0.0.1:8031", "key": "..."}`
+   in `~/.duplicompare/ai.json` (or set `DUPLICOMPARE_MBMAI_URL` /
+   `DUPLICOMPARE_MBMAI_KEY`) and keep an SSH tunnel open
+   (`ssh -N -L 8031:127.0.0.1:8031 deploy@<vps>`). The key must be a *private*
+   mbm-ai key; the shared tools key is public-only and gets a 403.
+
 Keep the `data/` folder next to `index.html` when you move or send a report.
 
 ## Speed notes

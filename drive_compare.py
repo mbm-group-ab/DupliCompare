@@ -22,6 +22,7 @@ import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import ai_assist
 from report_writer import write_report
 
 
@@ -459,6 +460,7 @@ class App(tk.Tk):
         self.path_a = tk.StringVar()
         self.path_b = tk.StringVar()
         self.status = tk.StringVar(value="Ready.")
+        self.last_compare = None  # (a, b, summary, result) of the last run
 
         pad = {"padx": 10, "pady": 6}
         frm = ttk.Frame(self.compare_tab)
@@ -474,6 +476,8 @@ class App(tk.Tk):
 
         self.compare_btn = ttk.Button(frm, text="Compare", command=self.start_compare)
         self.compare_btn.grid(row=2, column=1, pady=20)
+        ttk.Button(frm, text="AI summary / advice", command=self.ask_ai_compare).grid(
+            row=2, column=2, pady=20)
 
         ttk.Label(frm, textvariable=self.status, foreground="#555").grid(
             row=3, column=0, columnspan=3, sticky="w", **pad
@@ -515,6 +519,7 @@ class App(tk.Tk):
 
         try:
             summary, result = compare_folders(a, b, progress_cb)
+            self.last_compare = (a, b, summary, result)
             self.status.set("Writing report...")
             out_dir = _default_out_dir("compare-report")
             index = write_compare_report(a, b, summary, result, out_dir)
@@ -634,6 +639,9 @@ class App(tk.Tk):
             side="left", padx=4
         )
         ttk.Button(bottom, text="Export HTML Report", command=self.export_dup_report).pack(
+            side="left", padx=4
+        )
+        ttk.Button(bottom, text="AI summary / advice", command=self.ask_ai_duplicates).pack(
             side="left", padx=4
         )
 
@@ -789,6 +797,30 @@ class App(tk.Tk):
                 label += " ▼" if reverse else " ▲"
             self.dup_tree.heading(c, text=label)
 
+    # ------------------------------------------------------------------ AI
+
+    def ask_ai_compare(self):
+        if not self.last_compare:
+            messagebox.showinfo("AI help", "Run a compare first.")
+            return
+        a, b, summary, result = self.last_compare
+        self._open_ai("compare", lambda: ai_assist.build_compare_digest(a, b, summary, result))
+
+    def ask_ai_duplicates(self):
+        groups = [g for g in self.dup_groups if g]
+        if not self.dup_rootmap or not groups:
+            messagebox.showinfo("AI help", "Run a scan that finds duplicates first.")
+            return
+        rootmap = self.dup_rootmap
+        self._open_ai("duplicates", lambda: ai_assist.build_duplicates_digest(rootmap, groups))
+
+    def _open_ai(self, kind, make_digest):
+        cfg = ai_assist.load_config()
+        if not cfg:
+            messagebox.showinfo("AI help", ai_assist.SETUP_HELP)
+            return
+        AiWindow(self, kind, make_digest(), cfg)
+
     def describe_path(self, path):
         return self.dup_rootmap.describe(path) if self.dup_rootmap else path
 
@@ -822,6 +854,85 @@ class App(tk.Tk):
         index = write_duplicates_report(self.dup_rootmap, groups, out_dir)
         self.dup_status.set(f"Report saved: {out_dir}")
         _open_in_browser(index)
+
+
+class AiWindow(tk.Toplevel):
+    """Shows exactly what will be sent to the AI, sends it on request, shows the answer."""
+
+    def __init__(self, parent, kind, digest, cfg):
+        super().__init__(parent)
+        self.kind, self.digest, self.cfg = kind, digest, cfg
+        self.title("AI summary / advice")
+        self.geometry("820x700")
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text="Answer language:").pack(side="left")
+        self.lang = tk.StringVar(value="English")
+        ttk.Combobox(top, textvariable=self.lang, values=list(ai_assist.LANGUAGES),
+                     state="readonly", width=12).pack(side="left", padx=6)
+        self.send_btn = ttk.Button(top, text="Send to AI", command=self.send)
+        self.send_btn.pack(side="left", padx=6)
+        self.status = tk.StringVar(value="Only this summary is sent: names, sizes and counts, "
+                                         "never file contents. Private mode: local model only.")
+        ttk.Label(self, textvariable=self.status, foreground="#555", wraplength=780).pack(
+            fill="x", padx=10)
+
+        ttk.Label(self, text="What will be sent:").pack(anchor="w", padx=10, pady=(8, 0))
+        sent = tk.Text(self, height=11, wrap="word")
+        sent.insert("1.0", digest)
+        sent.config(state="disabled")
+        sent.pack(fill="x", padx=10)
+
+        self.progress = ttk.Progressbar(self, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=6)
+
+        ttk.Label(self, text="AI answer:").pack(anchor="w", padx=10)
+        self.answer = tk.Text(self, wrap="word")
+        self.answer.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bottom, text="Copy", command=self.copy).pack(side="left", padx=4)
+        ttk.Button(bottom, text="Save as .txt...", command=self.save).pack(side="left", padx=4)
+
+    def send(self):
+        self.send_btn.config(state="disabled")
+        self.progress.start(10)
+        self.status.set("Waiting for the AI (the local model can take a minute or two)...")
+        system, prompt = ai_assist.build_prompt(self.kind, self.digest, self.lang.get())
+
+        def work():
+            try:
+                text = ai_assist.ask_ai(system, prompt, self.cfg)
+                self.after(0, lambda: self._done(text, None))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda: self._done(None, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, text, error):
+        self.progress.stop()
+        self.send_btn.config(state="normal")
+        if error:
+            self.status.set(error)
+            return
+        self.status.set("Done. The AI only advises; check before you delete or move anything.")
+        self.answer.delete("1.0", "end")
+        self.answer.insert("1.0", text)
+
+    def copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.answer.get("1.0", "end").strip())
+
+    def save(self):
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".txt", filetypes=[("Text", "*.txt")],
+            initialfile=f"ai-advice-{self.kind}.txt")
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.answer.get("1.0", "end").strip() + "\n")
 
 
 class DuplicateGroupWindow(tk.Toplevel):
