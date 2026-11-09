@@ -1,23 +1,28 @@
 """
 Drive/Folder Compare Tool
-Cross-platform GUI (Tkinter) app to compare two folders (recursively) and
-produce an HTML report showing missing, extra, and mismatched files.
+Cross-platform GUI (Tkinter) app to:
+  - compare two folders (recursively) and write an indexed, searchable HTML
+    report (whole folders missing on one side are collapsed to one row), and
+  - find duplicate files across any number of folders and say which folders
+    each duplicate lives in.
 """
 
 import os
 import sys
 import threading
 import webbrowser
-import html
 import hashlib
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 import shutil
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from report_writer import write_report
 
 
 FILE_TYPE_FILTERS = {
@@ -33,25 +38,55 @@ FILE_TYPE_FILTERS = {
     },
 }
 
+PARTIAL_HASH_BYTES = 64 * 1024      # head + tail of a file, cheap pre-filter
+READ_BUFFER_BYTES = 4 * 1024 * 1024  # full-hash read size
+DEFAULT_WORKERS = 4                  # fine for HDD and SSD; raise for fast SSD/NVMe
+
+
+# ------------------------------------------------------------------ scanning
+
+def scan_tree(root, extensions=None, min_size=0):
+    """Yield (full_path, size) for every regular file under root.
+
+    Uses os.scandir so file sizes come with the directory listing (on Windows
+    no extra system call per file). Symlinks are not followed.
+    """
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            it = os.scandir(current)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if extensions is not None and \
+                                os.path.splitext(entry.name)[1].lower() not in extensions:
+                            continue
+                        size = entry.stat(follow_symlinks=False).st_size
+                        if size >= min_size:
+                            yield entry.path, size
+                except OSError:
+                    continue
+
 
 def build_file_map(root):
     """Return dict: relative_path -> size_in_bytes for every file under root."""
-    file_map = {}
     root = os.path.abspath(root)
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            rel = os.path.relpath(full, root).replace("\\", "/")
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                size = -1
-            file_map[rel] = size
-    return file_map
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    cut = len(prefix)
+    return {
+        full[cut:].replace("\\", "/"): size
+        for full, size in scan_tree(root)
+    }
 
 
 def human_size(num_bytes):
-    if num_bytes < 0:
+    if num_bytes is None or num_bytes < 0:
         return "N/A"
     step = 1024.0
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -61,6 +96,48 @@ def human_size(num_bytes):
     return f"{num_bytes:.2f} PB"
 
 
+# ------------------------------------------------------------------- compare
+
+def _dir_set(file_map):
+    """Every directory (relative, '/'-separated) that contains a file."""
+    dirs = set()
+    for rel in file_map:
+        d = rel.rpartition("/")[0]
+        while d and d not in dirs:
+            dirs.add(d)
+            d = d.rpartition("/")[0]
+    return dirs
+
+
+def _collapse_one_sided(only_files, other_dirs):
+    """Split files that exist only on one side into
+    - whole folders missing on the other side: {folder: [count, size]}
+    - loose files inside folders that exist on both sides: [(rel, size)]
+    """
+    folders = {}
+    loose = []
+    top_cache = {}
+    for rel, size in only_files:
+        parent = rel.rpartition("/")[0]
+        if parent not in top_cache:
+            top = None
+            acc = ""
+            for part in parent.split("/") if parent else []:
+                acc = f"{acc}/{part}" if acc else part
+                if acc not in other_dirs:
+                    top = acc
+                    break
+            top_cache[parent] = top
+        top = top_cache[parent]
+        if top is None:
+            loose.append((rel, size))
+        else:
+            entry = folders.setdefault(top, [0, 0])
+            entry[0] += 1
+            entry[1] += max(size, 0)
+    return folders, loose
+
+
 def compare_folders(path_a, path_b, progress_cb=None):
     if progress_cb:
         progress_cb(f"Scanning: {path_a}")
@@ -68,260 +145,295 @@ def compare_folders(path_a, path_b, progress_cb=None):
     if progress_cb:
         progress_cb(f"Scanning: {path_b}")
     map_b = build_file_map(path_b)
+    if progress_cb:
+        progress_cb("Comparing...")
 
-    all_keys = set(map_a.keys()) | set(map_b.keys())
+    only_a = [(k, map_a[k]) for k in map_a if k not in map_b]
+    only_b = [(k, map_b[k]) for k in map_b if k not in map_a]
+    mismatch = sorted(
+        (k, map_a[k], map_b[k]) for k in map_a
+        if k in map_b and map_a[k] != map_b[k]
+    )
 
-    rows = []
-    for key in sorted(all_keys):
-        in_a = key in map_a
-        in_b = key in map_b
-        if in_a and in_b:
-            if map_a[key] != map_b[key]:
-                rows.append((key, "Size mismatch", map_a[key], map_b[key]))
-        elif in_a and not in_b:
-            rows.append((key, "Missing in B", map_a[key], None))
-        elif in_b and not in_a:
-            rows.append((key, "Missing in A", None, map_b[key]))
+    folders_a, loose_a = _collapse_one_sided(only_a, _dir_set(map_b))
+    folders_b, loose_b = _collapse_one_sided(only_b, _dir_set(map_a))
 
+    result = {
+        "folders_only_a": sorted(
+            ((k, v[0], v[1]) for k, v in folders_a.items()), key=lambda r: -r[2]),
+        "folders_only_b": sorted(
+            ((k, v[0], v[1]) for k, v in folders_b.items()), key=lambda r: -r[2]),
+        "files_only_a": sorted(loose_a),
+        "files_only_b": sorted(loose_b),
+        "mismatch": mismatch,
+    }
     summary = {
         "a_files": len(map_a),
         "b_files": len(map_b),
         "a_size": sum(v for v in map_a.values() if v > 0),
         "b_size": sum(v for v in map_b.values() if v > 0),
-        "diff_count": len(rows),
+        "only_a": len(only_a),
+        "only_b": len(only_b),
+        "only_a_size": sum(max(s, 0) for _k, s in only_a),
+        "only_b_size": sum(max(s, 0) for _k, s in only_b),
+        "mismatch": len(mismatch),
+        "diff_count": len(only_a) + len(only_b) + len(mismatch),
     }
-    return summary, rows
+    return summary, result
 
 
-def write_html_report(path_a, path_b, summary, rows, out_path):
-    diff_class = {
-        "Missing in B": "missing",
-        "Missing in A": "extra",
-        "Size mismatch": "mismatch",
-    }
-
-    row_html = []
-    for rel, status, size_a, size_b in rows:
-        cls = diff_class.get(status, "")
-        row_html.append(
-            "<tr><td>{}</td><td class='{}'>{}</td><td>{}</td><td>{}</td></tr>".format(
-                html.escape(rel),
-                cls,
-                html.escape(status),
-                human_size(size_a) if size_a is not None else "-",
-                human_size(size_b) if size_b is not None else "-",
-            )
-        )
-
-    diff_table = "\n".join(row_html) if row_html else (
-        "<tr><td colspan='4' style='text-align:center;color:#2e7d32;font-weight:bold'>"
-        "No differences found - folders are identical.</td></tr>"
-    )
-
-    html_doc = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Folder Compare Report</title>
-<style>
-body{{font-family:Segoe UI,Arial,sans-serif;margin:20px;background:#fafafa;color:#222}}
-h1{{font-size:20px}} h2{{font-size:16px;margin-top:30px}}
-table{{border-collapse:collapse;width:100%;margin-bottom:20px;background:#fff}}
-th,td{{border:1px solid #ddd;padding:6px 10px;font-size:13px;text-align:left;word-break:break-all}}
-th{{background:#333;color:#fff}}
-tr:nth-child(even){{background:#f2f2f2}}
-.missing{{color:#b00020;font-weight:bold}}
-.extra{{color:#006400;font-weight:bold}}
-.mismatch{{color:#b8860b;font-weight:bold}}
-.meta{{color:#555;font-size:12px}}
-</style></head><body>
-<h1>Folder Comparison Report</h1>
-<p class="meta">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-<p><b>Folder A:</b> {html.escape(path_a)}<br><b>Folder B:</b> {html.escape(path_b)}</p>
-<h2>Summary</h2>
-<table>
-<tr><th></th><th>Folder A</th><th>Folder B</th></tr>
-<tr><td>Files</td><td>{summary['a_files']}</td><td>{summary['b_files']}</td></tr>
-<tr><td>Total size</td><td>{human_size(summary['a_size'])}</td><td>{human_size(summary['b_size'])}</td></tr>
-</table>
-<h2>Differences ({summary['diff_count']} items)</h2>
-<table>
-<tr><th>Relative path</th><th>Status</th><th>Size A</th><th>Size B</th></tr>
-{diff_table}
-</table>
-</body></html>
-"""
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
+def write_compare_report(path_a, path_b, summary, result, out_dir):
+    """Write the compare report folder; returns the index.html path."""
+    info = [("Folder A:", path_a), ("Folder B:", path_b)]
+    cards = [
+        ("Files in A", f"{summary['a_files']:,}"),
+        ("Files in B", f"{summary['b_files']:,}"),
+        ("Size of A", human_size(summary["a_size"])),
+        ("Size of B", human_size(summary["b_size"])),
+        ("Only in A", f"{summary['only_a']:,} files ({human_size(summary['only_a_size'])})"),
+        ("Only in B", f"{summary['only_b']:,} files ({human_size(summary['only_b_size'])})"),
+        ("Different size", f"{summary['mismatch']:,}"),
+    ]
+    folder_cols = [("path", "Folder", "text"), ("files", "Files", "num"), ("size", "Size", "size")]
+    file_cols = [("path", "File", "text"), ("size", "Size", "size")]
+    tabs = [
+        {
+            "id": "a-folders", "label": "Folders only in A",
+            "note": "Whole folders that exist in A and have no files at all in B (biggest first).",
+            "cols": folder_cols, "rows": [list(r) for r in result["folders_only_a"]],
+        },
+        {
+            "id": "b-folders", "label": "Folders only in B",
+            "note": "Whole folders that exist in B and have no files at all in A (biggest first).",
+            "cols": folder_cols, "rows": [list(r) for r in result["folders_only_b"]],
+        },
+        {
+            "id": "a-files", "label": "Files missing in B",
+            "note": "Files in A that B lacks, inside folders that exist on both sides.",
+            "cols": file_cols, "rows": [list(r) for r in result["files_only_a"]],
+        },
+        {
+            "id": "b-files", "label": "Files missing in A",
+            "note": "Files in B that A lacks, inside folders that exist on both sides.",
+            "cols": file_cols, "rows": [list(r) for r in result["files_only_b"]],
+        },
+        {
+            "id": "size", "label": "Different size",
+            "note": "Same relative path on both sides but the size differs.",
+            "cols": [("path", "File", "text"), ("a", "Size in A", "size"), ("b", "Size in B", "size")],
+            "rows": [list(r) for r in result["mismatch"]],
+        },
+    ]
+    return write_report(out_dir, "Folder Comparison Report", info, cards, tabs)
 
 
-def file_hash(path, chunk_size=1024 * 1024, max_bytes=None):
-    """MD5 of a file. If max_bytes is set, only hash the first max_bytes
-    (used for a cheap partial-hash pre-filter)."""
-    h = hashlib.md5()
-    read_total = 0
-    with open(path, "rb") as f:
-        while max_bytes is None or read_total < max_bytes:
-            to_read = chunk_size if max_bytes is None else min(chunk_size, max_bytes - read_total)
-            chunk = f.read(to_read)
-            if not chunk:
-                break
-            h.update(chunk)
-            read_total += len(chunk)
-    return h.hexdigest()
+# --------------------------------------------------------------- duplicates
+
+def file_digest(path, size, partial=False):
+    """Content digest of a file. partial=True hashes only the first and last
+    PARTIAL_HASH_BYTES (a cheap pre-filter); otherwise the whole file."""
+    h = hashlib.blake2b(digest_size=16)
+    with open(path, "rb", buffering=0) as f:
+        if partial:
+            h.update(f.read(PARTIAL_HASH_BYTES))
+            if size > PARTIAL_HASH_BYTES:
+                f.seek(max(size - PARTIAL_HASH_BYTES, PARTIAL_HASH_BYTES))
+                h.update(f.read(PARTIAL_HASH_BYTES))
+        else:
+            buf = bytearray(READ_BUFFER_BYTES)
+            view = memoryview(buf)
+            while True:
+                n = f.readinto(buf)
+                if not n:
+                    break
+                h.update(view[:n])
+    return h.digest()
 
 
-PARTIAL_HASH_BYTES = 64 * 1024
+def _hash_many(items, workers, partial, progress_cb, label):
+    """Digest (or None on read error) for each (path, size) item, in order."""
+    def work(item):
+        try:
+            return file_digest(item[0], item[1], partial)
+        except OSError:
+            return None
+
+    out = []
+    total = len(items)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for i, digest in enumerate(pool.map(work, items), start=1):
+            out.append(digest)
+            if progress_cb and i % 200 == 0:
+                progress_cb(f"{label} ({i}/{total})")
+    return out
 
 
-def find_duplicates(root, progress_cb=None, extensions=None, min_size_bytes=0, max_workers=8):
-    """Scan root recursively and return list of duplicate groups.
+def find_duplicates(roots, progress_cb=None, extensions=None, min_size_bytes=0,
+                    max_workers=DEFAULT_WORKERS):
+    """Scan one or more folders and return a list of duplicate groups.
 
-    Each group is a list of full file paths that share identical size and
-    content (md5 hash). Only groups with 2+ files are returned.
-
-    extensions: optional set of lowercase extensions (e.g. {".zip", ".rar"})
-    to restrict the scan to. None means all files.
-    min_size_bytes: skip files smaller than this.
+    Each group is a list of full file paths with identical size and content
+    (across ALL the folders together). Empty files are ignored. If one folder
+    is inside another, each file is still counted once.
     """
-    root = os.path.abspath(root)
-    if progress_cb:
-        progress_cb(f"Scanning: {root}")
+    if isinstance(roots, str):
+        roots = [roots]
+    roots = sorted({os.path.abspath(r) for r in roots}, key=len, reverse=True)
 
+    seen = set()
     by_size = defaultdict(list)
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
-            if extensions is not None and os.path.splitext(name)[1].lower() not in extensions:
+    for root in roots:
+        if progress_cb:
+            progress_cb(f"Scanning: {root}")
+        for path, size in scan_tree(root, extensions, max(min_size_bytes, 1)):
+            key = os.path.normcase(path)
+            if key in seen:
                 continue
-            full = os.path.join(dirpath, name)
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                continue
-            if size < min_size_bytes:
-                continue
-            by_size[size].append(full)
+            seen.add(key)
+            by_size[size].append(path)
+    seen.clear()
 
     # Only same-size files can possibly be duplicates.
-    candidates = [paths for paths in by_size.values() if len(paths) > 1]
-    total_candidates = sum(len(paths) for paths in candidates)
-    checked = 0
-    lock = threading.Lock()
+    candidates = [(p, size) for size, paths in by_size.items() if len(paths) > 1 for p in paths]
 
-    def bump(msg_prefix):
-        nonlocal checked
-        with lock:
-            checked += 1
-            n = checked
-        if progress_cb and n % 25 == 0:
-            progress_cb(f"{msg_prefix} ({n}/{total_candidates})")
-
-    # Pass 1: cheap partial hash (first 64KB) to cut down full-file reads.
+    # Pass 1: head + tail hash.
+    digests = _hash_many(candidates, max_workers, True, progress_cb, "Quick-hashing files...")
     by_partial = defaultdict(list)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for paths in candidates:
-            for full in paths:
-                fut = pool.submit(file_hash, full, max_bytes=PARTIAL_HASH_BYTES)
-                futures[fut] = full
-        for fut in as_completed(futures):
-            full = futures[fut]
-            bump("Quick-hashing files...")
-            try:
-                digest = fut.result()
-            except OSError:
-                continue
-            by_partial[digest].append(full)
+    for item, digest in zip(candidates, digests):
+        if digest is not None:
+            by_partial[(item[1], digest)].append(item)
 
-    partial_groups = [paths for paths in by_partial.values() if len(paths) > 1]
+    final = []  # (size, [paths])
+    need_full = []
+    for (size, _d), items in by_partial.items():
+        if len(items) < 2:
+            continue
+        if size <= PARTIAL_HASH_BYTES:  # the partial hash already covered the whole file
+            final.append((size, [p for p, _s in items]))
+        else:
+            need_full.extend(items)
 
-    # Pass 2: full hash only for files that still collide after the quick check.
-    checked = 0
-    total_full = sum(len(paths) for paths in partial_groups)
-    by_hash = defaultdict(list)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for paths in partial_groups:
-            for full in paths:
-                fut = pool.submit(file_hash, full)
-                futures[fut] = full
-        for fut in as_completed(futures):
-            full = futures[fut]
-            with lock:
-                checked += 1
-                n = checked
-            if progress_cb and n % 25 == 0:
-                progress_cb(f"Hashing files... ({n}/{total_full})")
-            try:
-                digest = fut.result()
-            except OSError:
-                continue
-            by_hash[digest].append(full)
+    # Pass 2: full hash only for files that still collide.
+    digests = _hash_many(need_full, max_workers, False, progress_cb, "Hashing files...")
+    by_full = defaultdict(list)
+    for item, digest in zip(need_full, digests):
+        if digest is not None:
+            by_full[(item[1], digest)].append(item[0])
+    for (size, _d), paths in by_full.items():
+        if len(paths) > 1:
+            final.append((size, paths))
 
-    groups = [paths for paths in by_hash.values() if len(paths) > 1]
-    groups.sort(key=lambda paths: -os.path.getsize(paths[0]))
-    return groups
+    final.sort(key=lambda g: -g[0])
+    return [paths for _size, paths in final]
 
 
-def write_duplicates_report(root, groups, out_path):
-    total_wasted = sum(
-        os.path.getsize(paths[0]) * (len(paths) - 1) for paths in groups
-    )
+class RootMap:
+    """Maps a file path to the scanned folder it belongs to ([1], [2], ...)."""
 
-    group_html = []
-    for idx, paths in enumerate(groups, start=1):
-        size = os.path.getsize(paths[0])
-        cols = "\n".join(
-            "<td>{}</td>".format(html.escape(os.path.relpath(p, root)))
-            for p in paths
-        )
-        group_html.append(
-            "<tr><td>{}</td><td>{}</td><td>{}</td>{}</tr>".format(
-                idx, len(paths), human_size(size), cols
-            )
-        )
+    def __init__(self, roots):
+        self.roots = [os.path.abspath(r) for r in roots]
+        self._keys = [os.path.normcase(r).rstrip("\\/") + os.sep for r in self.roots]
+        self._order = sorted(range(len(self.roots)), key=lambda i: -len(self._keys[i]))
 
-    max_cols = max((len(paths) for paths in groups), default=0)
-    header_cols = "".join(f"<th>Copy {i+1}</th>" for i in range(max_cols))
+    def locate(self, path):
+        """Return (root_index, path relative to that root); (-1, path) if none."""
+        p = os.path.normcase(path)
+        for i in self._order:
+            if p.startswith(self._keys[i]):
+                return i, path[len(self._keys[i]):]
+        return -1, path
 
-    body = "\n".join(group_html) if group_html else (
-        f"<tr><td colspan='{3 + max_cols}' style='text-align:center;color:#2e7d32;"
-        "font-weight:bold'>No duplicate files found.</td></tr>"
-    )
+    @staticmethod
+    def tag(index):
+        return f"[{index + 1}]" if index >= 0 else "[?]"
 
-    html_doc = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Duplicate Files Report</title>
-<style>
-body{{font-family:Segoe UI,Arial,sans-serif;margin:20px;background:#fafafa;color:#222}}
-h1{{font-size:20px}} h2{{font-size:16px;margin-top:30px}}
-table{{border-collapse:collapse;width:100%;margin-bottom:20px;background:#fff}}
-th,td{{border:1px solid #ddd;padding:6px 10px;font-size:13px;text-align:left;word-break:break-all}}
-th{{background:#333;color:#fff}}
-tr:nth-child(even){{background:#f2f2f2}}
-.meta{{color:#555;font-size:12px}}
-</style></head><body>
-<h1>Duplicate Files Report</h1>
-<p class="meta">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-<p><b>Folder:</b> {html.escape(root)}</p>
-<h2>Summary</h2>
-<table>
-<tr><th>Duplicate groups</th><th>Wasted space (extra copies)</th></tr>
-<tr><td>{len(groups)}</td><td>{human_size(total_wasted)}</td></tr>
-</table>
-<h2>Duplicate Groups</h2>
-<table>
-<tr><th>#</th><th>Copies</th><th>Size (each)</th>{header_cols}</tr>
-{body}
-</table>
-</body></html>
-"""
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
+    def describe(self, path):
+        i, rel = self.locate(path)
+        return f"{self.tag(i)} {rel}"
+
+    def root_indexes(self, paths):
+        return sorted({self.locate(p)[0] for p in paths})
+
+    def where(self, paths):
+        return ", ".join(self.tag(i) for i in self.root_indexes(paths))
+
+    def is_cross(self, paths):
+        return len(self.root_indexes(paths)) > 1
+
+
+def write_duplicates_report(rootmap, groups, out_dir):
+    """Write the duplicates report folder; returns the index.html path."""
+    rows_cross, rows_same = [], []
+    total_wasted = 0
+    for paths in groups:
+        try:
+            size = os.path.getsize(paths[0])
+        except OSError:
+            size = -1
+        wasted = max(size, 0) * (len(paths) - 1)
+        total_wasted += wasted
+        row = [len(paths), size, wasted, rootmap.where(paths),
+               [rootmap.describe(p) for p in paths]]
+        (rows_cross if rootmap.is_cross(paths) else rows_same).append(row)
+
+    def finish(rows):
+        rows.sort(key=lambda r: -r[2])
+        for n, r in enumerate(rows, start=1):
+            r.insert(0, n)
+        return rows
+
+    cols = [("n", "#", "num"), ("copies", "Copies", "num"), ("size", "Size each", "size"),
+            ("wasted", "Wasted", "size"), ("where", "In folders", "text"),
+            ("files", "Files", "lines")]
+    info = [("Folders:", "")] + [
+        (RootMap.tag(i), p) for i, p in enumerate(rootmap.roots)
+    ]
+    cards = [
+        ("Duplicate groups", f"{len(groups):,}"),
+        ("Across different folders", f"{len(rows_cross):,}"),
+        ("Inside one folder", f"{len(rows_same):,}"),
+        ("Wasted space (extra copies)", human_size(total_wasted)),
+    ]
+    tabs = [
+        {
+            "id": "across", "label": "Across different folders",
+            "note": "The same file exists in two or more of the scanned folders. "
+                    "'In folders' says which ones ([n] = the folder list above).",
+            "cols": cols, "rows": finish(rows_cross),
+        },
+        {
+            "id": "inside", "label": "Inside one folder",
+            "note": "All copies of the file are inside the same scanned folder.",
+            "cols": cols, "rows": finish(rows_same),
+        },
+    ]
+    return write_report(out_dir, "Duplicate Files Report", info, cards, tabs)
+
+
+def _default_out_dir(prefix):
+    base = os.path.join(os.path.expanduser("~"), "Desktop")
+    if not os.path.isdir(base):
+        base = os.getcwd()
+    return os.path.join(base, f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+
+
+def _open_in_browser(path):
+    webbrowser.open(Path(os.path.abspath(path)).as_uri())
+
+
+# ----------------------------------------------------------------------- GUI
+
+SHOW_ALL = "All groups"
+SHOW_CROSS = "Across different folders"
+SHOW_SAME = "Inside one folder"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DupliCompare")
-        self.geometry("980x560")
-        self.minsize(860, 460)
+        self.geometry("1020x640")
+        self.minsize(900, 520)
         try:
             self.iconbitmap(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico"))
         except tk.TclError:
@@ -337,6 +449,9 @@ class App(tk.Tk):
 
         self._build_compare_tab()
         self._build_duplicates_tab()
+
+    def _error(self, text):
+        self.after(0, lambda: messagebox.showerror("Error", text))
 
     # ---------------------------------------------------------------- Compare
 
@@ -399,18 +514,14 @@ class App(tk.Tk):
             self.status.set(msg)
 
         try:
-            summary, rows = compare_folders(a, b, progress_cb)
-            out_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-            if not os.path.isdir(out_dir):
-                out_dir = os.getcwd()
-            out_path = os.path.join(
-                out_dir, f"compare-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
-            )
-            write_html_report(a, b, summary, rows, out_path)
-            self.status.set(f"Done. {summary['diff_count']} difference(s) found. Report: {out_path}")
-            webbrowser.open(f"file://{os.path.abspath(out_path)}")
+            summary, result = compare_folders(a, b, progress_cb)
+            self.status.set("Writing report...")
+            out_dir = _default_out_dir("compare-report")
+            index = write_compare_report(a, b, summary, result, out_dir)
+            self.status.set(f"Done. {summary['diff_count']} difference(s) found. Report: {out_dir}")
+            _open_in_browser(index)
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Error", str(exc))
+            self._error(str(exc))
             self.status.set("Error occurred.")
         finally:
             self.progress.stop()
@@ -419,25 +530,46 @@ class App(tk.Tk):
     # ------------------------------------------------------------- Duplicates
 
     def _build_duplicates_tab(self):
-        self.dup_path = tk.StringVar()
         self.dup_status = tk.StringVar(value="Ready.")
-        self.dup_groups = []  # list[list[str]] kept in sync with tree rows
+        self.dup_groups = []        # list[list[str]] kept in sync with tree rows
+        self.dup_rootmap = None
+        self.dup_where = {}         # group index -> "[1], [3]"
+        self.dup_cross = {}         # group index -> bool
 
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 10, "pady": 4}
+
+        # --- folder list
+        folders = ttk.Frame(self.dup_tab)
+        folders.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(folders, text="Folders to scan\n(any number):").grid(row=0, column=0, sticky="nw")
+        self.dup_list = tk.Listbox(folders, height=4, selectmode="extended", activestyle="none")
+        self.dup_list.grid(row=0, column=1, sticky="we", padx=8)
+        lsb = ttk.Scrollbar(folders, orient="vertical", command=self.dup_list.yview)
+        self.dup_list.configure(yscrollcommand=lsb.set)
+        lsb.grid(row=0, column=2, sticky="ns")
+        btns = ttk.Frame(folders)
+        btns.grid(row=0, column=3, sticky="n", padx=(8, 0))
+        ttk.Button(btns, text="Add folder...", command=self.add_dup_folder).pack(fill="x", pady=1)
+        ttk.Button(btns, text="Remove selected", command=self.remove_dup_folders).pack(fill="x", pady=1)
+        ttk.Button(btns, text="Clear", command=lambda: self.dup_list.delete(0, "end")).pack(fill="x", pady=1)
+        folders.columnconfigure(1, weight=1)
+
+        # --- options
         top = ttk.Frame(self.dup_tab)
         top.pack(fill="x")
 
-        ttk.Label(top, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(top, textvariable=self.dup_path, width=45).grid(row=0, column=1, **pad)
-        ttk.Button(top, text="Browse...", command=self.browse_dup).grid(row=0, column=2, **pad)
-
-        ttk.Label(top, text="Type:").grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(top, text="Type:").grid(row=0, column=0, sticky="w", **pad)
         self.dup_filter = tk.StringVar(value="All files")
-        filter_combo = ttk.Combobox(
+        ttk.Combobox(
             top, textvariable=self.dup_filter, values=list(FILE_TYPE_FILTERS.keys()),
-            state="readonly", width=28,
-        )
-        filter_combo.grid(row=0, column=4, **pad)
+            state="readonly", width=30,
+        ).grid(row=0, column=1, **pad)
+
+        ttk.Label(top, text="Threads:").grid(row=0, column=2, sticky="e", **pad)
+        self.dup_threads = tk.IntVar(value=DEFAULT_WORKERS)
+        ttk.Spinbox(top, from_=1, to=32, width=4, textvariable=self.dup_threads).grid(
+            row=0, column=3, **pad)
+        ttk.Label(top, text="(HDD: 2-4, SSD: 8+)", foreground="#777").grid(row=0, column=4, sticky="w")
 
         self.scan_btn = ttk.Button(top, text="Scan for Duplicates", command=self.start_duplicates)
         self.scan_btn.grid(row=0, column=5, **pad)
@@ -445,14 +577,22 @@ class App(tk.Tk):
         ttk.Label(top, text="Min file size:").grid(row=1, column=0, sticky="w", **pad)
         self.min_size_mb = tk.DoubleVar(value=0)
         self.min_size_label = tk.StringVar(value="No limit")
-        min_size_scale = ttk.Scale(
+        ttk.Scale(
             top, from_=0, to=1024, orient="horizontal", variable=self.min_size_mb,
             command=self._on_min_size_change, length=300,
-        )
-        min_size_scale.grid(row=1, column=1, columnspan=3, sticky="we", **pad)
+        ).grid(row=1, column=1, sticky="we", **pad)
         ttk.Label(top, textvariable=self.min_size_label, width=14).grid(
-            row=1, column=4, sticky="w", **pad
+            row=1, column=2, columnspan=2, sticky="w", **pad
         )
+
+        ttk.Label(top, text="Show:").grid(row=1, column=4, sticky="e", **pad)
+        self.dup_view = tk.StringVar(value=SHOW_ALL)
+        show = ttk.Combobox(
+            top, textvariable=self.dup_view, values=[SHOW_ALL, SHOW_CROSS, SHOW_SAME],
+            state="readonly", width=24,
+        )
+        show.grid(row=1, column=5, **pad)
+        show.bind("<<ComboboxSelected>>", lambda _e: self._populate_dup_tree())
 
         self.dup_progress = ttk.Progressbar(self.dup_tab, mode="indeterminate", length=500)
         self.dup_progress.pack(fill="x", padx=10, pady=(0, 6))
@@ -464,23 +604,22 @@ class App(tk.Tk):
         list_frame = ttk.Frame(self.dup_tab)
         list_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        columns = ("group", "copies", "size", "name")
+        columns = ("group", "copies", "size", "where", "name")
         self.dup_tree = ttk.Treeview(
             list_frame, columns=columns, show="headings", selectmode="browse"
         )
         self.dup_sort_state = {"col": None, "reverse": False}
-        self.dup_tree.heading("group", text="#", command=lambda: self.sort_dup_tree("group"))
-        self.dup_tree.heading(
-            "copies", text="Copies", command=lambda: self.sort_dup_tree("copies")
-        )
-        self.dup_tree.heading(
-            "size", text="Size (each)", command=lambda: self.sort_dup_tree("size")
-        )
-        self.dup_tree.heading("name", text="File name", command=lambda: self.sort_dup_tree("name"))
-        self.dup_tree.column("group", width=40, anchor="center")
+        self._col_labels = {
+            "group": "#", "copies": "Copies", "size": "Size (each)",
+            "where": "In folders", "name": "File name",
+        }
+        for c in columns:
+            self.dup_tree.heading(c, text=self._col_labels[c], command=lambda c=c: self.sort_dup_tree(c))
+        self.dup_tree.column("group", width=50, anchor="center")
         self.dup_tree.column("copies", width=70, anchor="center")
         self.dup_tree.column("size", width=100, anchor="center")
-        self.dup_tree.column("name", width=350, anchor="w")
+        self.dup_tree.column("where", width=130, anchor="center")
+        self.dup_tree.column("name", width=420, anchor="w")
 
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.dup_tree.yview)
         self.dup_tree.configure(yscrollcommand=vsb.set)
@@ -498,77 +637,123 @@ class App(tk.Tk):
             side="left", padx=4
         )
 
-    def browse_dup(self):
-        d = filedialog.askdirectory(title="Select folder to scan for duplicates")
-        if d:
-            self.dup_path.set(d)
+    def add_dup_folder(self):
+        d = filedialog.askdirectory(title="Add a folder to scan for duplicates")
+        if not d:
+            return
+        d = os.path.abspath(d)
+        existing = {os.path.normcase(p) for p in self.dup_list.get(0, "end")}
+        if os.path.normcase(d) not in existing:
+            self.dup_list.insert("end", d)
+
+    def remove_dup_folders(self):
+        for i in reversed(self.dup_list.curselection()):
+            self.dup_list.delete(i)
 
     def _on_min_size_change(self, _value=None):
         mb = self.min_size_mb.get()
         self.min_size_label.set("No limit" if mb < 1 else f"≥ {mb:.0f} MB")
 
     def start_duplicates(self):
-        a = self.dup_path.get().strip()
-        if not a:
-            messagebox.showwarning("Missing input", "Please select a folder.")
+        roots = list(self.dup_list.get(0, "end"))
+        if not roots:
+            messagebox.showwarning("Missing input", "Add at least one folder.")
             return
-        if not os.path.isdir(a):
-            messagebox.showerror("Invalid path", f"Folder does not exist:\n{a}")
-            return
+        for r in roots:
+            if not os.path.isdir(r):
+                messagebox.showerror("Invalid path", f"Folder does not exist:\n{r}")
+                return
+
+        try:
+            workers = max(1, min(32, int(self.dup_threads.get())))
+        except (tk.TclError, ValueError):
+            workers = DEFAULT_WORKERS
 
         self.scan_btn.config(state="disabled")
         self.dup_progress.start(10)
         extensions = FILE_TYPE_FILTERS.get(self.dup_filter.get())
         min_size_bytes = int(self.min_size_mb.get() * 1024 * 1024)
         thread = threading.Thread(
-            target=self.run_duplicates, args=(a, extensions, min_size_bytes), daemon=True
+            target=self.run_duplicates, args=(roots, extensions, min_size_bytes, workers), daemon=True
         )
         thread.start()
 
-    def run_duplicates(self, a, extensions=None, min_size_bytes=0):
+    def run_duplicates(self, roots, extensions, min_size_bytes, workers):
         def progress_cb(msg):
             self.dup_status.set(msg)
 
         try:
-            groups = find_duplicates(a, progress_cb, extensions=extensions, min_size_bytes=min_size_bytes)
-            self.dup_root = os.path.abspath(a)
-            self.after(0, lambda: self._populate_dup_tree(groups))
-            self.dup_status.set(f"Done. {len(groups)} duplicate group(s) found.")
+            groups = find_duplicates(
+                roots, progress_cb, extensions=extensions,
+                min_size_bytes=min_size_bytes, max_workers=workers,
+            )
+            rootmap = RootMap(roots)
+            self.after(0, lambda: self._set_dup_result(groups, rootmap))
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Error", str(exc))
+            self._error(str(exc))
             self.dup_status.set("Error occurred.")
         finally:
             self.dup_progress.stop()
             self.scan_btn.config(state="normal")
 
-    def _populate_dup_tree(self, groups, chunk_size=200):
+    def _set_dup_result(self, groups, rootmap):
+        self.dup_groups = groups
+        self.dup_rootmap = rootmap
+        self.dup_where = {i: rootmap.where(p) for i, p in enumerate(groups)}
+        self.dup_cross = {i: rootmap.is_cross(p) for i, p in enumerate(groups)}
+        self._populate_dup_tree()
+
+    def _visible_indexes(self):
+        mode = self.dup_view.get()
+        out = []
+        for idx, paths in enumerate(self.dup_groups):
+            if not paths:
+                continue
+            if mode == SHOW_CROSS and not self.dup_cross.get(idx):
+                continue
+            if mode == SHOW_SAME and self.dup_cross.get(idx):
+                continue
+            out.append(idx)
+        return out
+
+    def _row_values(self, idx):
+        paths = self.dup_groups[idx]
+        try:
+            size = os.path.getsize(paths[0])
+        except OSError:
+            size = -1
+        return (idx + 1, len(paths), human_size(size), self.dup_where.get(idx, ""),
+                os.path.basename(paths[0]))
+
+    def _populate_dup_tree(self, chunk_size=200):
         """Insert rows in chunks via `after` so the UI stays responsive and
         the whole (potentially huge) result set still gets loaded fully."""
-        self.dup_groups = groups
         self.dup_tree.delete(*self.dup_tree.get_children())
         self.dup_sort_state = {"col": None, "reverse": False}
-        total = len(groups)
+        for c, label in self._col_labels.items():
+            self.dup_tree.heading(c, text=label)
+        indexes = self._visible_indexes()
+        total = len(indexes)
+        token = object()
+        self._populate_token = token
 
         def load_chunk(start):
+            if self._populate_token is not token:
+                return  # a newer populate started
             end = min(start + chunk_size, total)
-            for idx in range(start, end):
-                paths = groups[idx]
-                size = os.path.getsize(paths[0]) if paths else 0
-                name = os.path.basename(paths[0]) if paths else ""
-                self.dup_tree.insert(
-                    "", "end", iid=str(idx),
-                    values=(idx + 1, len(paths), human_size(size), name),
-                )
+            for idx in indexes[start:end]:
+                self.dup_tree.insert("", "end", iid=str(idx), values=self._row_values(idx))
             if end < total:
                 self.dup_status.set(f"Loading duplicate groups... {end}/{total}")
                 self.after(1, lambda: load_chunk(end))
             else:
-                self.dup_status.set(f"Done. {total} duplicate group(s) found.")
+                self.dup_status.set(f"Done. {total} duplicate group(s) shown "
+                                    f"({len(self.dup_groups)} found).")
 
         if total:
             load_chunk(0)
         else:
-            self.dup_status.set("Done. No duplicate groups found.")
+            self.dup_status.set("Done. No duplicate groups to show.")
 
     def sort_dup_tree(self, col):
         state = self.dup_sort_state
@@ -584,21 +769,28 @@ class App(tk.Tk):
             if col == "copies":
                 return len(paths)
             if col == "size":
-                return os.path.getsize(paths[0])
+                try:
+                    return os.path.getsize(paths[0])
+                except OSError:
+                    return -1
+            if col == "where":
+                return self.dup_where.get(idx, "")
             if col == "name":
                 return os.path.basename(paths[0]).lower()
             return idx
 
-        ids = [iid for iid in self.dup_tree.get_children("")]
+        ids = list(self.dup_tree.get_children(""))
         ids.sort(key=lambda iid: sort_key(int(iid)), reverse=reverse)
         for pos, iid in enumerate(ids):
             self.dup_tree.move(iid, "", pos)
 
-        for c in ("group", "copies", "size", "name"):
-            label = {"group": "#", "copies": "Copies", "size": "Size (each)", "name": "File name"}[c]
+        for c, label in self._col_labels.items():
             if c == col:
                 label += " ▼" if reverse else " ▲"
             self.dup_tree.heading(c, text=label)
+
+    def describe_path(self, path):
+        return self.dup_rootmap.describe(path) if self.dup_rootmap else path
 
     def open_selected_group(self):
         sel = self.dup_tree.selection()
@@ -606,7 +798,7 @@ class App(tk.Tk):
             messagebox.showinfo("No selection", "Select a duplicate group first.")
             return
         idx = int(sel[0])
-        DuplicateGroupWindow(self, idx, self.dup_groups[idx], self.dup_root, self.on_group_changed)
+        DuplicateGroupWindow(self, idx, self.dup_groups[idx], self.on_group_changed)
 
     def on_group_changed(self, idx, new_paths):
         """Called by DuplicateGroupWindow after a file was deleted/renamed/moved."""
@@ -616,38 +808,31 @@ class App(tk.Tk):
                 self.dup_tree.delete(str(idx))
             return
         self.dup_groups[idx] = new_paths
-        size = os.path.getsize(new_paths[0])
-        name = os.path.basename(new_paths[0])
-        self.dup_tree.item(
-            str(idx), values=(idx + 1, len(new_paths), human_size(size), name)
-        )
+        self.dup_where[idx] = self.dup_rootmap.where(new_paths)
+        self.dup_cross[idx] = self.dup_rootmap.is_cross(new_paths)
+        if self.dup_tree.exists(str(idx)):
+            self.dup_tree.item(str(idx), values=self._row_values(idx))
 
     def export_dup_report(self):
         groups = [g for g in self.dup_groups if g]
-        if not getattr(self, "dup_root", None):
+        if not self.dup_rootmap:
             messagebox.showinfo("Nothing to export", "Run a scan first.")
             return
-        out_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-        if not os.path.isdir(out_dir):
-            out_dir = os.getcwd()
-        out_path = os.path.join(
-            out_dir, f"duplicates-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
-        )
-        write_duplicates_report(self.dup_root, groups, out_path)
-        self.dup_status.set(f"Report saved: {out_path}")
-        webbrowser.open(f"file://{os.path.abspath(out_path)}")
+        out_dir = _default_out_dir("duplicates-report")
+        index = write_duplicates_report(self.dup_rootmap, groups, out_dir)
+        self.dup_status.set(f"Report saved: {out_dir}")
+        _open_in_browser(index)
 
 
 class DuplicateGroupWindow(tk.Toplevel):
     """Shows every copy in a duplicate group side by side, each with its own
     Delete / Rename / Move controls."""
 
-    def __init__(self, parent, group_idx, paths, root, on_changed):
+    def __init__(self, parent, group_idx, paths, on_changed):
         super().__init__(parent)
         self.parent = parent
         self.group_idx = group_idx
         self.paths = list(paths)
-        self.root = root
         self.on_changed = on_changed
 
         self.title(f"Duplicate group #{group_idx + 1} ({len(self.paths)} copies)")
@@ -688,17 +873,13 @@ class DuplicateGroupWindow(tk.Toplevel):
         card = ttk.Frame(parent, borderwidth=1, relief="solid", padding=10)
         card.grid(row=0, column=col, padx=6, pady=6, sticky="n")
 
-        try:
-            rel = os.path.relpath(path, self.root)
-        except ValueError:
-            rel = path
         size = human_size(os.path.getsize(path)) if os.path.exists(path) else "N/A"
 
         ttk.Label(card, text=f"Copy {col + 1}", font=("Segoe UI", 10, "bold")).pack(
             anchor="w"
         )
         path_lbl = tk.Text(card, width=32, height=4, wrap="char", borderwidth=0)
-        path_lbl.insert("1.0", rel)
+        path_lbl.insert("1.0", self.parent.describe_path(path))
         path_lbl.config(state="disabled")
         path_lbl.pack(pady=(4, 4))
         ttk.Label(card, text=f"Size: {size}", foreground="#555").pack(anchor="w")

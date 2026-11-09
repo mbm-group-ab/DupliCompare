@@ -43,13 +43,32 @@ download links on the landing page (`releases/latest/download/...`) work.
 ## Usage
 
 1. Launch the app.
-2. **Compare tab**: pick "Folder A" and "Folder B", click Compare. An HTML
-   report opens automatically (also saved to your Desktop) showing:
-   - File/size summary for each folder
-   - Every file missing from one side, extra on the other, or size-mismatched
-3. **Duplicates tab**: pick a folder, click "Scan for Duplicates". Click any
-   column header to sort; double-click a group (or "Open Group...") to see
-   every copy side by side and delete/rename/move them.
+2. **Compare tab**: pick "Folder A" and "Folder B", click Compare. A report
+   *folder* is written to your Desktop (`compare-report-<time>/`) and its
+   `index.html` opens in the browser. Tabs: folders only in A / only in B
+   (whole missing folders are one row, biggest first), files missing on one
+   side, and files whose size differs. Every tab has search, sorting, paging
+   and "Download CSV"; the same rows are also saved as `.csv` files next to
+   `index.html` (for Excel or for feeding to a script/AI).
+3. **Duplicates tab**: add any number of folders ("Add folder..."), set the
+   type filter, minimum size and threads (HDD: 2-4, SSD: 8+) and click
+   "Scan for Duplicates". Duplicates are found across all folders together;
+   the "In folders" column says which folders ([1], [2]...) hold copies, and
+   "Show" filters to groups across different folders or inside one folder.
+   Double-click a group to see every copy side by side and delete / rename /
+   move any of them. "Export HTML Report" writes the same kind of report
+   folder (tabs: across folders / inside one folder).
+
+Keep the `data/` folder next to `index.html` when you move or send a report.
+
+## Speed notes
+
+Scanning uses `os.scandir` (sizes come with the listing), duplicates use a
+size -> head+tail hash -> full hash pipeline (BLAKE2b, 4 MB reads, a few
+threads). Empty files are ignored. On the 3-folder synthetic test (18k small
+files + 13 x 16 MB) the scan went from 69 s to 12 s and compare from ~1.6 s to
+0.25 s, with identical results. A C++ core was judged not worth it: the cost is
+disk I/O, not Python.
 
 ## Deploying the landing page
 
