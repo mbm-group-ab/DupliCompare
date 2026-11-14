@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+
+# Secrets (checkup 2026-11-14)
+.env*
+!.env.example
