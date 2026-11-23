@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tkinter as tk
@@ -83,6 +83,32 @@ def _coverage_parts(report, tr):
     return cards, tab
 
 
+REPORT_CONTRACT = "mbm.storage.report/1"
+REPORT_LIMITATIONS = {
+    "compare_quick": "Quick mode compares names and sizes only; equal sizes do not prove equal contents.",
+    "compare_verified": "Verified mode hashes files that exist on both sides with the same size.",
+    "duplicates": "Duplicates are files with the same size and full BLAKE2b hash; hardlinks are listed apart.",
+    "lower_bound": "Files inside folders that could not be listed are not counted; not_checked counts "
+                   "failed folders and listing errors.",
+}
+
+
+def report_envelope(kind, roots, report, summary=None, limitations=()):
+    """Shared storage report envelope (plans/docs/storage-contracts.md) for report.json.
+    DupliCompare reports stay on the user's machine, so they are full mode with paths."""
+    return {
+        "contract": REPORT_CONTRACT,
+        "tool": "duplicompare",
+        "version": VERSION,
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": "full",
+        "scope": {"kind": kind, "roots": list(roots)},
+        "coverage": report.coverage(),
+        "summary": dict(summary or {}),
+        "limitations": [REPORT_LIMITATIONS[k] for k in limitations],
+    }
+
+
 def write_compare_report(path_a, path_b, summary, result, report, out_dir, tr, lang="en"):
     """Write the compare report folder; returns the index.html path."""
     info = [(tr("folder_a"), path_a), (tr("folder_b"), path_b),
@@ -136,8 +162,11 @@ def write_compare_report(path_a, path_b, summary, result, report, out_dir, tr, l
              "cols": file_cols, "rows": [list(r) for r in result["content_changed"]]},
         ]
     tabs.append(err_tab)
+    mode_key = "compare_verified" if summary["mode"] == eng.MODE_VERIFIED else "compare_quick"
+    machine = report_envelope("compare", (path_a, path_b), report, summary,
+                              (mode_key, "lower_bound"))
     return write_report(out_dir, tr("report_compare_title"), info, cards, tabs,
-                        ui=_report_ui(tr), lang=lang, rtl=lang in RTL)
+                        ui=_report_ui(tr), lang=lang, rtl=lang in RTL, machine=machine)
 
 
 def write_duplicates_report(rootmap, groups, hardlinks, report, out_dir, tr, lang="en"):
@@ -181,8 +210,13 @@ def write_duplicates_report(rootmap, groups, hardlinks, report, out_dir, tr, lan
          "rows": [[[rootmap.describe(p) for p in h]] for h in hardlinks]},
         err_tab,
     ]
+    machine = report_envelope(
+        "duplicates", rootmap.roots, report,
+        {"groups": len(groups), "groups_across": len(rows_cross), "groups_inside": len(rows_same),
+         "wasted_bytes": total_wasted, "hardlink_sets": len(hardlinks)},
+        ("duplicates", "lower_bound"))
     return write_report(out_dir, tr("report_dup_title"), info, cards, tabs,
-                        ui=_report_ui(tr), lang=lang, rtl=lang in RTL)
+                        ui=_report_ui(tr), lang=lang, rtl=lang in RTL, machine=machine)
 
 
 def _report_ui(tr):

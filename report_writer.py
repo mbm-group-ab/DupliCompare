@@ -49,7 +49,7 @@ def _csv_cell(value, col_type):
     return value
 
 
-def write_report(out_dir, title, info, cards, tabs, ui=None, lang="en", rtl=False):
+def write_report(out_dir, title, info, cards, tabs, ui=None, lang="en", rtl=False, machine=None):
     """Write a report folder and return the path of its index.html.
 
     info:  list of (label, text) shown under the title (folders, legend...).
@@ -58,6 +58,8 @@ def write_report(out_dir, title, info, cards, tabs, ui=None, lang="en", rtl=Fals
     ui:    the page's own texts (UI_EN keys) in the user's language.
     CSV cells that start like a spreadsheet formula (= + - @) get a leading
     quote, so opening a report in Excel never runs a file name as a formula.
+    machine: optional dict written as report.json (the shared storage report
+    envelope); the tab row counts are added under "counts".
     """
     data_dir = os.path.join(out_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
@@ -102,6 +104,11 @@ def write_report(out_dir, title, info, cards, tabs, ui=None, lang="en", rtl=Fals
     index_path = os.path.join(out_dir, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(page)
+    if machine is not None:
+        doc = dict(machine)
+        doc["counts"] = {t["id"]: t["count"] for t in meta_tabs}
+        with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
     return index_path
 
 

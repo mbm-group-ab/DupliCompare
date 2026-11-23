@@ -68,6 +68,22 @@ class ScanReport:
         return not self.roots_failed and self.error_count == 0 and \
             self.unreadable == 0 and self.changed == 0
 
+    def coverage(self):
+        """Coverage block of the shared storage report contract (mbm.storage.report/1).
+
+        Files in a folder that could not be listed are never seen, so `not_checked`
+        counts failed roots and listing errors only as a lower bound (said in the
+        report's limitations)."""
+        unsure = self.unreadable + self.changed
+        return {
+            "total": self.files_seen,
+            "checked": max(0, self.files_seen - unsure),
+            "errors": unsure,
+            "not_checked": len(self.roots_failed) + self.error_count,
+            "complete": self.complete,
+            "dirs_scanned": self.dirs_scanned,
+        }
+
     def merge(self, other):
         for p, m in other.errors:
             if len(self.errors) < MAX_ERRORS_KEPT:

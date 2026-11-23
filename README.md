@@ -76,7 +76,9 @@ when you move or send a report.
   the journal.
 - `dc_i18n.py`: all texts in EN/SV/FA (`tests/test_i18n.py` checks keys and
   placeholders).
-- `report_writer.py`: the report folder (`index.html` + `data/` + `.csv`).
+- `report_writer.py`: the report folder (`index.html` + `data/` + `.csv` + `report.json`, a machine-readable
+  summary: tool, version, scanned folders, coverage (total, checked, errors, not checked, complete) and
+  limitations).
 - `ai_assist.py`: the optional AI helper.
 
 ## Speed notes
