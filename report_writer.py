@@ -22,20 +22,42 @@ CHUNK_ROWS = 5000
 # Column types: text | num | size (bytes, shown human readable) | lines (list of strings)
 
 
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+UI_EN = {
+    "generated": "Generated:", "search": "Search (several words = all must match)...",
+    "csv": "Download CSV (filtered)", "loading": "Loading", "rows_of": "of", "rows": "rows",
+    "page": "Page", "prev": "Prev", "next": "Next", "nothing_matches": "Nothing matches.",
+    "nothing": "Nothing to show: no differences found.",
+    "keep_data": "(keep the data folder next to index.html)",
+}
+
+
+def safe_text(text):
+    """Spreadsheet-safe text: a cell that starts like a formula gets a leading quote."""
+    text = str(text)
+    return "'" + text if text.startswith(FORMULA_START) else text
+
+
 def _csv_cell(value, col_type):
     if col_type == "lines":
-        return " | ".join(value)
+        return safe_text(" | ".join(value))
     if value is None:
         return ""
+    if isinstance(value, str):
+        return safe_text(value)
     return value
 
 
-def write_report(out_dir, title, info, cards, tabs):
+def write_report(out_dir, title, info, cards, tabs, ui=None, lang="en", rtl=False):
     """Write a report folder and return the path of its index.html.
 
     info:  list of (label, text) shown under the title (folders, legend...).
     cards: list of (label, text) summary numbers.
     tabs:  list of dicts: id, label, note, cols=[(key, label, type)], rows=[[...]].
+    ui:    the page's own texts (UI_EN keys) in the user's language.
+    CSV cells that start like a spreadsheet formula (= + - @) get a leading
+    quote, so opening a report in Excel never runs a file name as a formula.
     """
     data_dir = os.path.join(out_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
@@ -72,9 +94,11 @@ def write_report(out_dir, title, info, cards, tabs):
         "info": [list(p) for p in info],
         "cards": [list(p) for p in cards],
         "tabs": meta_tabs,
+        "ui": dict(UI_EN, **(ui or {})),
     }
     meta_json = json.dumps(meta, ensure_ascii=True).replace("<", "\\u003c")
-    page = _PAGE.replace("__META__", meta_json).replace("__TITLE__", _escape(title))
+    page = (_PAGE.replace("__META__", meta_json).replace("__TITLE__", _escape(title))
+            .replace("__LANG__", _escape(lang)).replace("__DIR__", "rtl" if rtl else "ltr"))
     index_path = os.path.join(out_dir, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(page)
@@ -87,7 +111,7 @@ def _escape(text):
 
 
 _PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
@@ -112,10 +136,10 @@ h1{font-size:20px;margin:0 0 4px}
 .bar select,.bar button{padding:6px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
 .wrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;background:var(--card)}
-th,td{border:1px solid var(--bd);padding:5px 9px;font-size:13px;text-align:left;vertical-align:top;word-break:break-all}
+th,td{border:1px solid var(--bd);padding:5px 9px;font-size:13px;text-align:start;vertical-align:top;word-break:break-all}
 th{background:var(--hd);color:var(--hdfg);cursor:pointer;white-space:nowrap;user-select:none}
 tr:nth-child(even) td{background:var(--alt)}
-td.n{text-align:right;white-space:nowrap}
+td.n{text-align:end;white-space:nowrap}
 .pager{display:flex;gap:8px;align-items:center;margin:10px 0;font-size:13px}
 .pager button{padding:4px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
 .pager button:disabled{opacity:.4;cursor:default}
@@ -130,9 +154,9 @@ td.n{text-align:right;white-space:nowrap}
 <div class="note" id="note"></div>
 <div id="main">
  <div class="bar">
-  <input type="search" id="q" placeholder="Search (several words = all must match)...">
+  <input type="search" id="q">
   <select id="per"><option>100</option><option selected>200</option><option>500</option></select>
-  <button id="csv">Download CSV (filtered)</button>
+  <button id="csv"></button>
   <span id="status"></span>
  </div>
  <div class="wrap"><table id="tbl"></table></div>
@@ -141,7 +165,9 @@ td.n{text-align:right;white-space:nowrap}
 <script id="meta" type="application/json">__META__</script>
 <script>
 const META=JSON.parse(document.getElementById('meta').textContent);
+const UI=META.ui;
 const $=s=>document.querySelector(s);
+$('#q').placeholder=UI.search;$('#csv').textContent=UI.csv;
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const coll=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 function human(n){if(n==null||n<0)return '-';const u=['B','KB','MB','GB','TB','PB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i?n.toFixed(2):n)+' '+u[i];}
@@ -150,7 +176,7 @@ window.__chunk=(id,n,rows)=>{const t=tabs.find(x=>x.id===id);for(const r of rows
 let cur=null,q='',page=0,per=200,view=[],sort={c:-1,dir:1};
 
 $('#title').textContent=META.title;
-$('#gen').textContent='Generated: '+META.generated;
+$('#gen').textContent=UI.generated+' '+META.generated;
 $('#info').innerHTML=META.info.map(p=>'<div><b>'+esc(p[0])+'</b> '+esc(p[1])+'</div>').join('');
 $('#cards').innerHTML=META.cards.map(p=>'<div class="card"><div class="v">'+esc(p[1])+'</div><div class="l">'+esc(p[0])+'</div></div>').join('');
 $('#tabs').innerHTML=tabs.map((t,i)=>'<button data-i="'+i+'"'+(t.count?'':' disabled')+'>'+esc(t.label)+' ('+t.count.toLocaleString()+')</button>').join('');
@@ -161,7 +187,7 @@ function loadTab(t){
   t.p=(async()=>{
     for(let i=0;i<t.chunks;i++){
       await new Promise((ok,bad)=>{const s=document.createElement('script');s.src='data/'+t.id+'-'+i+'.js';s.onload=ok;s.onerror=()=>bad(new Error('Cannot load '+s.src));document.head.appendChild(s);});
-      if(cur===t)$('#status').textContent='Loading '+t.rows.length.toLocaleString()+' / '+t.count.toLocaleString()+' ...';
+      if(cur===t)$('#status').textContent=UI.loading+' '+t.rows.length.toLocaleString()+' / '+t.count.toLocaleString()+' ...';
     }
     t.hay=t.rows.map(r=>r.map(v=>Array.isArray(v)?v.join(' '):String(v)).join(' ').toLowerCase());
   })();
@@ -171,8 +197,8 @@ async function openTab(t){
   cur=t;q='';$('#q').value='';sort={c:-1,dir:1};
   document.querySelectorAll('#tabs button').forEach((b,i)=>b.classList.toggle('on',tabs[i]===t));
   $('#note').textContent=t.note||'';
-  $('#status').textContent='Loading ...';$('#tbl').innerHTML='';$('#pager').innerHTML='';
-  try{await loadTab(t);}catch(err){$('#status').textContent=err.message+' (keep the data folder next to index.html)';return;}
+  $('#status').textContent=UI.loading+' ...';$('#tbl').innerHTML='';$('#pager').innerHTML='';
+  try{await loadTab(t);}catch(err){$('#status').textContent=err.message+' '+UI.keep_data;return;}
   if(cur!==t)return;
   refilter();
 }
@@ -195,12 +221,12 @@ function cell(c,v){
 }
 function render(){
   const t=cur,pages=Math.max(1,Math.ceil(view.length/per));
-  $('#status').textContent=view.length.toLocaleString()+' of '+t.rows.length.toLocaleString()+' rows';
+  $('#status').textContent=view.length.toLocaleString()+' '+UI.rows_of+' '+t.rows.length.toLocaleString()+' '+UI.rows;
   const head='<tr>'+t.cols.map((c,i)=>'<th data-c="'+i+'">'+esc(c.label)+(sort.c===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr>';
   const slice=view.slice(page*per,(page+1)*per);
-  const body=slice.length?slice.map(i=>'<tr>'+t.cols.map((c,j)=>cell(c,t.rows[i][j])).join('')+'</tr>').join(''):'<tr><td colspan="'+t.cols.length+'" class="empty">Nothing matches.</td></tr>';
+  const body=slice.length?slice.map(i=>'<tr>'+t.cols.map((c,j)=>cell(c,t.rows[i][j])).join('')+'</tr>').join(''):'<tr><td colspan="'+t.cols.length+'" class="empty">'+esc(UI.nothing_matches)+'</td></tr>';
   $('#tbl').innerHTML=head+body;
-  $('#pager').innerHTML='<button id="p0"'+(page?'':' disabled')+'>&laquo;</button><button id="p1"'+(page?'':' disabled')+'>&lsaquo; Prev</button><span>Page '+(page+1)+' / '+pages+'</span><button id="p2"'+(page<pages-1?'':' disabled')+'>Next &rsaquo;</button><button id="p3"'+(page<pages-1?'':' disabled')+'>&raquo;</button>';
+  $('#pager').innerHTML='<button id="p0"'+(page?'':' disabled')+'>&laquo;</button><button id="p1"'+(page?'':' disabled')+'>&lsaquo; '+esc(UI.prev)+'</button><span>'+esc(UI.page)+' '+(page+1)+' / '+pages+'</span><button id="p2"'+(page<pages-1?'':' disabled')+'>'+esc(UI.next)+' &rsaquo;</button><button id="p3"'+(page<pages-1?'':' disabled')+'>&raquo;</button>';
   $('#p0').onclick=()=>{page=0;render();};$('#p1').onclick=()=>{page--;render();};
   $('#p2').onclick=()=>{page++;render();};$('#p3').onclick=()=>{page=pages-1;render();};
 }
@@ -210,13 +236,14 @@ $('#q').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{q
 $('#per').addEventListener('change',e=>{per=+e.target.value;page=0;if(cur)render();});
 $('#csv').addEventListener('click',()=>{
   if(!cur)return;
-  const q2=s=>'"'+String(s).replace(/"/g,'""')+'"';
+  const safe=s=>(typeof s==='string'&&/^[=+\-@\t\r]/.test(s))?"'"+s:s;
+  const q2=s=>'"'+String(safe(s)).replace(/"/g,'""')+'"';
   const lines=[cur.cols.map(c=>q2(c.label)).join(',')];
   for(const i of view){lines.push(cur.rows[i].map(v=>q2(Array.isArray(v)?v.join(' | '):(v==null?'':v))).join(','));}
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['﻿'+lines.join('\r\n')],{type:'text/csv'}));
   a.download=cur.id+'-filtered.csv';a.click();
 });
 const first=tabs.find(t=>t.count>0);
-if(first)openTab(first);else{$('#main').innerHTML='<div class="empty">Nothing to show — no differences found.</div>';}
+if(first)openTab(first);else{$('#main').innerHTML='<div class="empty">'+esc(UI.nothing)+'</div>';}
 </script></body></html>
 """

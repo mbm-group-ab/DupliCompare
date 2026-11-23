@@ -118,39 +118,39 @@
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6l3 3v15H6V6z"/><path d="M9 3v5H4"/></svg></div>
       <h3>Folder A vs. Folder B</h3>
-      <p>Recursively compares two folders by name and size, and flags every file that's missing, extra, or mismatched.</p>
+      <p>Quick mode compares names and sizes; verified mode also reads the contents, so “identical” really means identical. Unreadable files are listed, never silently skipped.</p>
     </div>
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
       <h3>Duplicate finder</h3>
-      <p>Scans any folder and groups files that are byte-for-byte identical (size + MD5 hash), not just same-named.</p>
+      <p>Scans several folders at once and groups files that are byte-for-byte identical (size, then BLAKE2b hash). Hardlinks are shown apart, since removing one frees no space.</p>
     </div>
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg></div>
-      <h3>Side-by-side cleanup</h3>
-      <p>Open any duplicate group and see every copy side by side — delete, rename, or move each one right from the app.</p>
+      <h3>Safe side-by-side cleanup</h3>
+      <p>Every action re-checks the file and a remaining copy first. Remove sends a copy to a quarantine folder you can restore from; permanent delete is a separate choice.</p>
     </div>
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12l6 6L21 6"/></svg></div>
-      <h3>Sortable results</h3>
-      <p>Click any column to sort by size, copy count, or name — large result sets load progressively without freezing.</p>
+      <h3>English, Svenska, فارسی</h3>
+      <p>The app and its reports come in three languages, with right-to-left layout for Farsi. Long scans can be cancelled at any time.</p>
     </div>
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16m8-8H4"/></svg></div>
       <h3>HTML reports</h3>
-      <p>Export a clean, shareable HTML report of every difference or duplicate group — no account or internet needed.</p>
+      <p>Searchable HTML reports with CSV files that are safe to open in Excel, including a coverage card and a list of anything that could not be read.</p>
     </div>
     <div class="card">
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7z"/></svg></div>
       <h3>100% local &amp; free</h3>
-      <p>Open source and MIT-licensed. Nothing leaves your machine — no cloud upload, no telemetry, no cost.</p>
+      <p>Open source and MIT-licensed. Nothing leaves your machine — no cloud upload, no telemetry, no cost. The optional AI helper is off unless you set it up.</p>
     </div>
   </section>
 
   <section class="steps">
     <div class="step"><h4>1. Download</h4><p>Grab the build for your OS above — a single portable executable.</p></div>
     <div class="step"><h4>2. Pick folders</h4><p>Choose Folder A/B to compare, or one folder to scan for duplicates.</p></div>
-    <div class="step"><h4>3. Clean up</h4><p>Review results side by side and delete, rename, or move files in place.</p></div>
+    <div class="step"><h4>3. Clean up</h4><p>Review copies side by side, then quarantine, move or rename them, each after a fresh check.</p></div>
   </section>
 
   <footer>
