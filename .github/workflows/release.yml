@@ -45,6 +45,7 @@ jobs:
   build:
     needs: check
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -57,6 +58,7 @@ jobs:
             artifact_name: DupliCompare-linux
             build_path: dist/DupliCompare
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,13 +84,20 @@ jobs:
 
   release:
     needs: [check, build]
-    if: needs.check.outputs.publish == 'true'
+    # A stuck or failed macOS build must not hold back the release: publish whatever built,
+    # as long as Windows and Linux did (checked below). A missing macOS file can be added later.
+    if: always() && needs.check.result == 'success' && needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
+      - name: Windows and Linux builds are present
+        run: |
+          ls -l out
+          test -f out/DupliCompare-windows.exe
+          test -f out/DupliCompare-linux
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.check.outputs.version }}
