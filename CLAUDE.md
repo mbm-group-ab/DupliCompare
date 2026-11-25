@@ -13,7 +13,7 @@ with quarantine / delete / move / rename per copy. Read `README.md` first (usage
 - `dc_i18n.py`: every UI and report text in EN/SV/FA; `tests/test_i18n.py` fails on a missing key/placeholder.
 - `report_writer.py`: the report folder (`index.html` + `data/` + formula-safe `.csv` + `report.json`, the shared
   storage report envelope `mbm.storage.report/1`, built by `report_envelope()` in `drive_compare.py` from
-  `ScanReport.coverage()`; field list in the plans repo, `docs/storage-contracts.md`).
+  `ScanReport.coverage()`; field list in the plans repo, `reference/storage-contracts.md`).
 - `ai_assist.py`: optional summary/advice through mbm-ai.
 - `index.html`, `robots.txt`, `sitemap.xml`, `assets/`: landing page `duplicompare.mbm-group.se`, English only
   (root rule for non-app sites).

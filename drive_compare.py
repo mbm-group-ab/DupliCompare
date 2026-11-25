@@ -94,7 +94,7 @@ REPORT_LIMITATIONS = {
 
 
 def report_envelope(kind, roots, report, summary=None, limitations=()):
-    """Shared storage report envelope (plans/docs/storage-contracts.md) for report.json.
+    """Shared storage report envelope (plans/reference/storage-contracts.md) for report.json.
     DupliCompare reports stay on the user's machine, so they are full mode with paths."""
     return {
         "contract": REPORT_CONTRACT,
